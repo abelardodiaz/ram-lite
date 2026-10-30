@@ -7,6 +7,12 @@
 //! - Pintado con doble bufer (bitmap en memoria + BitBlt): sin parpadeo.
 //! - Un temporizador cada 2 s lee la memoria en el mismo hilo de la ventana (la llamada no
 //!   bloquea) y actualiza la ventana, el historial y el icono de la bandeja.
+//! - CPU opcional ("Mostrar CPU" en el menu): con ella encendida el mismo temporizador lee
+//!   GetSystemTimes, la ventana crece con una fila y su grafica, y sale un segundo icono en la
+//!   bandeja. Apagada no se lee nada.
+//! - Discos opcionales (submenu "Discos"): espacio ocupado de las unidades marcadas y de WSL, cada
+//!   30 s. WSL se mide en un hilo corto (la ruta \\wsl.localhost podria tardar) y solo si ya esta
+//!   corriendo; el peso de su ext4.vhdx se lee siempre.
 //! - Preferencias en el registro (`settings`); "Iniciar con Windows" en Run (`autostart`).
 
 use std::cell::RefCell;
@@ -44,7 +50,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, FindWindowW, GetClientRect,
     GetCursorPos, GetMessageW, GetWindowRect, HICON, HMENU, HTCAPTION, HTCLIENT, HWND_NOTOPMOST,
     HWND_TOP, HWND_TOPMOST, IDC_ARROW, IsWindowVisible, KillTimer, LoadCursorW, MF_CHECKED,
-    MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
+    MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
     RegisterWindowMessageW, SM_CXSMICON, SW_HIDE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, SWP_NOACTIVATE,
     SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow,
     TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_COMMAND,
@@ -54,6 +60,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{PCWSTR, w};
 
+use crate::cpu;
+use crate::disk;
 use crate::mem::{self, History, Level, Mem};
 use crate::settings::{self, Settings};
 use crate::text::{self, Texts};
@@ -69,17 +77,28 @@ const MUTEX_NAME: PCWSTR = w!("Local\\io.github.abelardodiaz.ram-lite");
 const WM_TRAY: u32 = WM_APP + 1;
 /// Otra instancia pide que se muestre esta ventana.
 const WM_SHOW_REQ: u32 = WM_APP + 2;
+/// El hilo de WSL termino; LPARAM = Box<Vec<(distro, espacio)>>.
+const WM_WSL_DONE: u32 = WM_APP + 3;
 const TRAY_ID: u32 = 1;
+/// Segundo icono de la bandeja, solo con "Mostrar CPU".
+const TRAY_CPU_ID: u32 = 2;
 const ID_TOGGLE: usize = 1;
 const ID_TOPMOST: usize = 2;
 const ID_AUTOSTART: usize = 3;
 const ID_TASKMGR: usize = 4;
 const ID_QUIT: usize = 5;
+const ID_CPU: usize = 6;
+const ID_WSL: usize = 7;
+/// Unidades del submenu "Discos": ID_DISK_BASE + 0 = A:, ... + 25 = Z:.
+const ID_DISK_BASE: usize = 100;
 /// Temporizador que vigila si el raton salio de la ventana (para ocultar la X).
 const TIMER_HOVER: usize = 1;
 /// Temporizador de lectura de la memoria.
 const TIMER_SAMPLE: usize = 2;
 const SAMPLE_MS: u32 = 2000;
+/// Temporizador de lectura de los discos: el espacio cambia lento.
+const TIMER_DISK: usize = 3;
+const DISK_MS: u32 = 30_000;
 
 // Medidas en px logicos (a 96 dpi).
 const WIDTH: i32 = 260;
@@ -95,6 +114,37 @@ const SPARK_GAP: i32 = 9;
 const SPARK_H: i32 = 24;
 const FOOT_GAP: i32 = 7;
 const FOOT_LINE: i32 = 15;
+/// Separacion entre el pie de la RAM y la fila de la CPU.
+const CPU_GAP: i32 = 12;
+/// Separacion antes de cada fila de disco.
+const DISK_GAP: i32 = 10;
+
+/// Una fila de disco en la ventana.
+enum DiskRow {
+    Drive {
+        letter: char,
+        space: Option<disk::Space>,
+    },
+    Wsl {
+        distro: disk::Distro,
+        /// La maquina virtual de WSL estaba corriendo en la ultima lectura.
+        running: bool,
+        space: Option<disk::Space>,
+        /// Peso del ext4.vhdx en Windows.
+        vhdx: Option<u64>,
+    },
+}
+
+impl DiskRow {
+    /// Alto en px logicos, con la separacion de arriba.
+    fn height(&self) -> i32 {
+        let row = DISK_GAP + TEXT_LINE + BAR_GAP + BAR_H;
+        match self {
+            DiskRow::Drive { .. } => row,
+            DiskRow::Wsl { .. } => row + FOOT_GAP + FOOT_LINE,
+        }
+    }
+}
 /// X de cerrar: cuadro de CLOSE_SIZE en la esquina, a CLOSE_INSET del borde derecho y de arriba.
 const CLOSE_SIZE: i32 = 13;
 const CLOSE_INSET: i32 = 3;
@@ -118,6 +168,17 @@ struct Ui {
     tray_icon: HICON,
     tray_state: Option<(u32, Level)>,
     tray_size: i32,
+    /// CPU: lectura anterior para comparar, ultimo porcentaje, historial y su icono. Solo se
+    /// usan con `settings.show_cpu`.
+    cpu_prev: Option<cpu::Times>,
+    cpu: Option<f64>,
+    cpu_history: History,
+    cpu_icon: HICON,
+    cpu_state: Option<(u32, Level)>,
+    /// Discos y WSL elegidos que estan presentes, con su ultima lectura.
+    disk_rows: Vec<DiskRow>,
+    /// Hay un hilo midiendo WSL: no se lanza otro.
+    wsl_busy: bool,
     /// El raton esta sobre la ventana: se dibuja la X.
     hover: bool,
     /// El raton esta sobre la X.
@@ -163,12 +224,45 @@ fn point_of(lparam: LPARAM) -> (i32, i32) {
     )
 }
 
-fn window_height(dpi: u32) -> i32 {
+fn window_height(dpi: u32, show_cpu: bool, disks: &[DiskRow]) -> i32 {
     let row = TEXT_LINE + BAR_GAP + BAR_H;
+    let cpu = if show_cpu {
+        CPU_GAP + row + SPARK_GAP + SPARK_H
+    } else {
+        0
+    };
+    let disks: i32 = disks.iter().map(DiskRow::height).sum();
     px(
-        PAD_TOP + row + SPARK_GAP + SPARK_H + FOOT_GAP + FOOT_LINE + PAD_BOTTOM,
+        PAD_TOP + row + SPARK_GAP + SPARK_H + FOOT_GAP + FOOT_LINE + cpu + disks + PAD_BOTTOM,
         dpi,
     )
+}
+
+/// Ajusta el alto de la ventana a lo que se muestra (CPU, discos), sin moverla.
+fn resize(hwnd: HWND) {
+    let Some((dpi, height)) = with_ui(|ui| {
+        (
+            ui.dpi,
+            window_height(ui.dpi, ui.settings.show_cpu, &ui.disk_rows),
+        )
+    }) else {
+        return;
+    };
+    let mut rc = RECT::default();
+    unsafe {
+        if GetClientRect(hwnd, &mut rc).is_ok() && rc.bottom - rc.top == height {
+            return;
+        }
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            px(WIDTH, dpi),
+            height,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
 }
 
 /// Cuadro de la X en coordenadas de cliente, para un ancho de ventana `width`.
@@ -241,11 +335,19 @@ fn tooltip(m: Option<&Mem>) -> String {
     }
 }
 
-fn tray_data(hwnd: HWND, icon: HICON, tip: &str) -> NOTIFYICONDATAW {
+/// "CPU 23%" para el segundo icono.
+fn cpu_tooltip(p: Option<f64>) -> String {
+    match p {
+        Some(p) => format!("CPU {}", mem::percent_text(p)),
+        None => "CPU".to_string(),
+    }
+}
+
+fn tray_data(hwnd: HWND, id: u32, icon: HICON, tip: &str) -> NOTIFYICONDATAW {
     let mut nid = NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
-        uID: TRAY_ID,
+        uID: id,
         uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
         uCallbackMessage: WM_TRAY,
         hIcon: icon,
@@ -257,11 +359,196 @@ fn tray_data(hwnd: HWND, icon: HICON, tip: &str) -> NOTIFYICONDATAW {
     nid
 }
 
-fn add_tray(hwnd: HWND, icon: HICON, tip: &str) {
-    let nid = tray_data(hwnd, icon, tip);
+fn add_tray(hwnd: HWND, id: u32, icon: HICON, tip: &str) {
+    let nid = tray_data(hwnd, id, icon, tip);
     unsafe {
         let _ = Shell_NotifyIconW(NIM_ADD, &nid);
     }
+}
+
+fn remove_tray(hwnd: HWND, id: u32) {
+    let nid = tray_data(hwnd, id, HICON::default(), "");
+    unsafe {
+        let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
+    }
+}
+
+/// Enciende o apaga la CPU: preferencia, estado, segundo icono y alto de la ventana.
+fn set_show_cpu(hwnd: HWND, on: bool) {
+    settings::save_show_cpu(on);
+    let fresh = on.then(cpu::read);
+    let change = with_ui(|ui| {
+        ui.settings.show_cpu = on;
+        ui.cpu_prev = fresh.flatten();
+        ui.cpu = None;
+        ui.cpu_history = History::new();
+        ui.cpu_state = None;
+        let old = std::mem::take(&mut ui.cpu_icon);
+        if on {
+            ui.cpu_icon = icon::create(ui.tray_size, 0.0, GREEN);
+        }
+        (old, ui.cpu_icon)
+    });
+    let Some((old, current)) = change else {
+        return;
+    };
+    if on {
+        add_tray(hwnd, TRAY_CPU_ID, current, &cpu_tooltip(None));
+    } else {
+        remove_tray(hwnd, TRAY_CPU_ID);
+    }
+    unsafe {
+        if !old.is_invalid() {
+            let _ = DestroyIcon(old);
+        }
+    }
+    resize(hwnd);
+    redraw(hwnd);
+}
+
+/// Filas de disco segun lo elegido y lo que esta conectado ahora (una USB que se quito no sale).
+fn build_rows(s: &Settings) -> Vec<DiskRow> {
+    let mut rows: Vec<DiskRow> = disk::drives()
+        .into_iter()
+        .filter(|&l| s.disks & disk::bit(l) != 0)
+        .map(|letter| DiskRow::Drive {
+            letter,
+            space: None,
+        })
+        .collect();
+    if s.wsl {
+        rows.extend(disk::distros().into_iter().map(|distro| DiskRow::Wsl {
+            distro,
+            running: false,
+            space: None,
+            vhdx: None,
+        }));
+    }
+    rows
+}
+
+/// Lee los discos elegidos y lanza la medicion de WSL si esta corriendo.
+fn sample_disks(hwnd: HWND) {
+    let Some(prefs) = with_ui(|ui| ui.settings) else {
+        return;
+    };
+    let mut rows = build_rows(&prefs);
+    let has_wsl = rows.iter().any(|r| matches!(r, DiskRow::Wsl { .. }));
+    let wsl_up = has_wsl && disk::wsl_running();
+    for row in &mut rows {
+        match row {
+            DiskRow::Drive { letter, space } => *space = disk::space(&disk::root(*letter)),
+            DiskRow::Wsl {
+                distro,
+                running,
+                vhdx,
+                ..
+            } => {
+                *running = wsl_up;
+                *vhdx = disk::file_size(&distro.vhdx);
+            }
+        }
+    }
+    let names = with_ui(|ui| {
+        // Mientras llega la lectura nueva de WSL se queda la anterior.
+        for row in &mut rows {
+            if let DiskRow::Wsl {
+                distro,
+                running: true,
+                space,
+                ..
+            } = row
+            {
+                *space = ui.disk_rows.iter().find_map(|old| match old {
+                    DiskRow::Wsl {
+                        distro: d,
+                        space: s,
+                        ..
+                    } if d.name == distro.name => *s,
+                    _ => None,
+                });
+            }
+        }
+        let names: Vec<String> = if wsl_up && !ui.wsl_busy {
+            rows.iter()
+                .filter_map(|r| match r {
+                    DiskRow::Wsl { distro, .. } => Some(distro.name.clone()),
+                    DiskRow::Drive { .. } => None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        ui.wsl_busy |= !names.is_empty();
+        ui.disk_rows = rows;
+        names
+    })
+    .unwrap_or_default();
+    if !names.is_empty() {
+        let target = hwnd.0 as isize;
+        std::thread::spawn(move || {
+            let result: Vec<(String, Option<disk::Space>)> = names
+                .into_iter()
+                .map(|n| {
+                    let s = disk::space(&disk::wsl_root(&n));
+                    (n, s)
+                })
+                .collect();
+            let boxed = Box::into_raw(Box::new(result));
+            let posted = unsafe {
+                PostMessageW(
+                    Some(HWND(target as *mut c_void)),
+                    WM_WSL_DONE,
+                    WPARAM(0),
+                    LPARAM(boxed as isize),
+                )
+            };
+            if posted.is_err() {
+                // La ventana ya no existe: se libera aqui.
+                drop(unsafe { Box::from_raw(boxed) });
+            }
+        });
+    }
+    resize(hwnd);
+    if unsafe { IsWindowVisible(hwnd).as_bool() } {
+        redraw(hwnd);
+    }
+}
+
+/// Llego la lectura de WSL del hilo.
+fn wsl_done(hwnd: HWND, lparam: LPARAM) {
+    let result = unsafe { Box::from_raw(lparam.0 as *mut Vec<(String, Option<disk::Space>)>) };
+    with_ui(|ui| {
+        ui.wsl_busy = false;
+        for row in &mut ui.disk_rows {
+            if let DiskRow::Wsl { distro, space, .. } = row
+                && let Some((_, s)) = result.iter().find(|(n, _)| *n == distro.name)
+            {
+                *space = *s;
+            }
+        }
+    });
+    redraw(hwnd);
+}
+
+/// Marca o desmarca una unidad (`Some(letra)`) o WSL (`None`) y vuelve a medir.
+fn toggle_disk(hwnd: HWND, which: Option<char>) {
+    let saved = with_ui(|ui| match which {
+        Some(l) => {
+            ui.settings.disks ^= disk::bit(l);
+            (Some(ui.settings.disks), None)
+        }
+        None => {
+            ui.settings.wsl = !ui.settings.wsl;
+            (None, Some(ui.settings.wsl))
+        }
+    });
+    match saved {
+        Some((Some(mask), _)) => settings::save_disks(mask),
+        Some((_, Some(wsl))) => settings::save_wsl(wsl),
+        _ => return,
+    }
+    sample_disks(hwnd);
 }
 
 fn toggle(hwnd: HWND, topmost: bool) {
@@ -313,9 +600,52 @@ fn show_requested(hwnd: HWND, topmost: bool) {
     }
 }
 
-fn show_menu(hwnd: HWND, t: &Texts, topmost: bool) {
+/// Submenu "Discos": las unidades conectadas y WSL si hay distros, con su marca.
+fn disks_menu(s: &Settings) -> Option<HMENU> {
+    let checked = |on: bool| {
+        if on {
+            MF_STRING | MF_CHECKED
+        } else {
+            MF_STRING
+        }
+    };
+    unsafe {
+        let menu = CreatePopupMenu().ok()?;
+        for l in disk::drives() {
+            // "D:  Ventoy (116 GB)": con la etiqueta y el tamano se sabe que es cada letra.
+            let size = disk::space(&disk::root(l)).map(|s| s.total);
+            let name = match (disk::label(l), size) {
+                (Some(lb), Some(t)) => format!("{l}:  {lb} ({})", disk::size_short(t)),
+                (None, Some(t)) => format!("{l}:  ({})", disk::size_short(t)),
+                (Some(lb), None) => format!("{l}:  {lb}"),
+                (None, None) => format!("{l}:"),
+            };
+            let text = wide_z(&name);
+            let id = ID_DISK_BASE + (l as u8 - b'A') as usize;
+            let _ = AppendMenuW(
+                menu,
+                checked(s.disks & disk::bit(l) != 0),
+                id,
+                PCWSTR(text.as_ptr()),
+            );
+        }
+        let distros = disk::distros();
+        if !distros.is_empty() {
+            let names: Vec<&str> = distros.iter().map(|d| d.name.as_str()).collect();
+            let text = wide_z(&format!("WSL ({})", names.join(", ")));
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            let _ = AppendMenuW(menu, checked(s.wsl), ID_WSL, PCWSTR(text.as_ptr()));
+        }
+        Some(menu)
+    }
+}
+
+fn show_menu(hwnd: HWND, t: &Texts, prefs: &Settings) {
+    let (topmost, show_cpu) = (prefs.topmost, prefs.show_cpu);
     let toggle_text = wide_z(t.toggle);
     let topmost_text = wide_z(t.topmost);
+    let cpu_text = wide_z(t.show_cpu);
+    let disks_text = wide_z(t.disks);
     let autostart_text = wide_z(t.autostart);
     let taskmgr_text = wide_z(t.taskmgr);
     let quit_text = wide_z(t.quit);
@@ -333,6 +663,16 @@ fn show_menu(hwnd: HWND, t: &Texts, topmost: bool) {
         let _ = AppendMenuW(menu, MF_STRING, ID_TOGGLE, PCWSTR(toggle_text.as_ptr()));
         let _ = AppendMenuW(menu, MF_STRING, ID_TASKMGR, PCWSTR(taskmgr_text.as_ptr()));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(menu, checked(show_cpu), ID_CPU, PCWSTR(cpu_text.as_ptr()));
+        if let Some(sub) = disks_menu(prefs) {
+            // DestroyMenu del menu principal destruye tambien este submenu.
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING | MF_POPUP,
+                sub.0 as usize,
+                PCWSTR(disks_text.as_ptr()),
+            );
+        }
         let _ = AppendMenuW(
             menu,
             checked(topmost),
@@ -454,17 +794,25 @@ fn text_width(hdc: HDC, font: HFONT, s: &[u16]) -> i32 {
     }
 }
 
-/// Fila principal: "RAM  68%" a la izquierda, "10.9 / 15.9 GB" a la derecha y la barra debajo.
-fn ram_row(hdc: HDC, ui: &Ui, top: i32, width: i32) {
+/// Fila de un medidor: "RAM  68%" a la izquierda, `right` (p. ej. "10.9 / 15.9 GB") a la derecha
+/// y la barra debajo.
+fn metric_row(
+    hdc: HDC,
+    ui: &Ui,
+    top: i32,
+    width: i32,
+    name: &str,
+    pct: Option<f64>,
+    right: Option<String>,
+) {
     let d = ui.dpi;
     let x0 = px(PAD_X, d);
     let x1 = width - px(PAD_X, d);
     let baseline = top + px(13, d);
-    let pct = ui.mem.map(|m| m.percent());
     unsafe {
         SetTextAlign(hdc, TA_LEFT | TA_BASELINE);
         SetTextColor(hdc, cref(TEXT));
-        let label = wide("RAM");
+        let label = wide(name);
         SelectObject(hdc, HGDIOBJ(ui.fonts.label.0));
         // letter-spacing .05em de la UI de claude-usage-widgets.
         SetTextCharacterExtra(hdc, px(1, d).min(((12 * d) as i32 + 960) / 1920).max(0));
@@ -474,8 +822,7 @@ fn ram_row(hdc: HDC, ui: &Ui, top: i32, width: i32) {
         let pct_text = wide(&pct.map_or("--".to_string(), mem::percent_text));
         SelectObject(hdc, HGDIOBJ(ui.fonts.pct.0));
         let _ = TextOutW(hdc, x0 + lw + px(6, d), baseline, &pct_text);
-        if let Some(m) = ui.mem {
-            let right = format!("{} / {} GB", mem::gb(m.used()), mem::gb(m.total));
+        if let Some(right) = right {
             SetTextAlign(hdc, TA_RIGHT | TA_BASELINE);
             SetTextColor(hdc, cref(MUTED));
             SelectObject(hdc, HGDIOBJ(ui.fonts.small.0));
@@ -496,7 +843,7 @@ fn ram_row(hdc: HDC, ui: &Ui, top: i32, width: i32) {
 
 /// Ultimos 2 minutos: una columna por muestra, llenando desde la derecha. Gris si estaba en nivel
 /// normal; ambar o rojo si estaba alta.
-fn sparkline(hdc: HDC, ui: &Ui, top: i32, width: i32) {
+fn sparkline(hdc: HDC, ui: &Ui, history: &History, top: i32, width: i32) {
     let d = ui.dpi;
     let x0 = px(PAD_X, d);
     let x1 = width - px(PAD_X, d);
@@ -510,9 +857,9 @@ fn sparkline(hdc: HDC, ui: &Ui, top: i32, width: i32) {
     round_fill(hdc, &area, px(6, d), TRACK);
     let n = mem::HISTORY as f64;
     let slot = (x1 - x0) as f64 / n;
-    let first = mem::HISTORY - ui.history.len();
+    let first = mem::HISTORY - history.len();
     let gap = if slot >= 3.0 { 1.0 } else { 0.0 };
-    for (i, p) in ui.history.iter().enumerate() {
+    for (i, p) in history.iter().enumerate() {
         let left = x0 as f64 + (first + i) as f64 * slot;
         let col_h = ((h as f64 * p / 100.0).round() as i32).clamp(1, h);
         let rgb = match mem::level(p) {
@@ -553,6 +900,56 @@ fn footer(hdc: HDC, ui: &Ui, top: i32, width: i32) {
         let _ = TextOutW(hdc, px(PAD_X, d), baseline, &wide(&left));
         SetTextAlign(hdc, TA_RIGHT | TA_BASELINE);
         let _ = TextOutW(hdc, width - px(PAD_X, d), baseline, &wide(&right));
+    }
+}
+
+/// "372.1 / 476.3 GB" de un disco.
+fn space_text(s: &disk::Space) -> String {
+    disk::space_text(s)
+}
+
+/// Fila de un disco: "C:  78%" y "372.1 / 476.3 GB" con barra. WSL lleva ademas una linea con la
+/// distro y el peso de su ext4.vhdx, y dice "detenido" si no esta corriendo.
+fn disk_row(hdc: HDC, ui: &Ui, row: &DiskRow, top: i32, width: i32) {
+    match row {
+        DiskRow::Drive { letter, space } => {
+            let label = format!("{letter}:");
+            let pct = space.map(|s| s.percent());
+            metric_row(
+                hdc,
+                ui,
+                top,
+                width,
+                &label,
+                pct,
+                space.as_ref().map(space_text),
+            );
+        }
+        DiskRow::Wsl {
+            distro,
+            running,
+            space,
+            vhdx,
+        } => {
+            let (pct, right) = if *running {
+                (space.map(|s| s.percent()), space.as_ref().map(space_text))
+            } else {
+                (None, Some(ui.texts.wsl_off.to_string()))
+            };
+            metric_row(hdc, ui, top, width, "WSL", pct, right);
+            let d = ui.dpi;
+            let baseline = top + px(TEXT_LINE + BAR_GAP + BAR_H + FOOT_GAP + 11, d);
+            let line = match vhdx {
+                Some(b) => format!("{} - {} {} GB", distro.name, ui.texts.vhdx, mem::gb(*b)),
+                None => distro.name.clone(),
+            };
+            unsafe {
+                SelectObject(hdc, HGDIOBJ(ui.fonts.foot.0));
+                SetTextColor(hdc, cref(FAINT));
+                SetTextAlign(hdc, TA_LEFT | TA_BASELINE);
+                let _ = TextOutW(hdc, px(PAD_X, d), baseline, &wide(&line));
+            }
+        }
     }
 }
 
@@ -597,9 +994,25 @@ fn paint(hwnd: HWND, ui: &Ui) {
         let row_top = px(PAD_TOP, d);
         let spark_top = row_top + px(TEXT_LINE + BAR_GAP + BAR_H + SPARK_GAP, d);
         let foot_top = spark_top + px(SPARK_H + FOOT_GAP, d);
-        ram_row(mem_dc, ui, row_top, w);
-        sparkline(mem_dc, ui, spark_top, w);
+        let ram_right = ui
+            .mem
+            .map(|m| format!("{} / {} GB", mem::gb(m.used()), mem::gb(m.total)));
+        let ram_pct = ui.mem.map(|m| m.percent());
+        metric_row(mem_dc, ui, row_top, w, "RAM", ram_pct, ram_right);
+        sparkline(mem_dc, ui, &ui.history, spark_top, w);
         footer(mem_dc, ui, foot_top, w);
+        let mut y = foot_top + px(FOOT_LINE, d);
+        if ui.settings.show_cpu {
+            let cpu_top = y + px(CPU_GAP, d);
+            let cpu_spark = cpu_top + px(TEXT_LINE + BAR_GAP + BAR_H + SPARK_GAP, d);
+            metric_row(mem_dc, ui, cpu_top, w, "CPU", ui.cpu, None);
+            sparkline(mem_dc, ui, &ui.cpu_history, cpu_spark, w);
+            y = cpu_spark + px(SPARK_H, d);
+        }
+        for row in &ui.disk_rows {
+            disk_row(mem_dc, ui, row, y + px(DISK_GAP, d), w);
+            y += px(row.height(), d);
+        }
         if ui.hover {
             close_button(mem_dc, ui, w);
         }
@@ -655,16 +1068,52 @@ fn sample(hwnd: HWND) {
         (ui.tray_icon, new_icon)
     });
     if let Some((current, replaced)) = tray {
-        let nid = tray_data(hwnd, current, &tooltip(Some(&m)));
-        unsafe {
-            let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
-            if let Some(old) = replaced.filter(|i| !i.is_invalid()) {
-                let _ = DestroyIcon(old);
-            }
-        }
+        update_tray(hwnd, TRAY_ID, current, replaced, &tooltip(Some(&m)));
     }
+    sample_cpu(hwnd);
     if unsafe { IsWindowVisible(hwnd).as_bool() } {
         redraw(hwnd);
+    }
+}
+
+/// Pone el icono y el texto de ayuda en la bandeja y libera el icono reemplazado.
+fn update_tray(hwnd: HWND, id: u32, current: HICON, replaced: Option<HICON>, tip: &str) {
+    let nid = tray_data(hwnd, id, current, tip);
+    unsafe {
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+        if let Some(old) = replaced.filter(|i| !i.is_invalid()) {
+            let _ = DestroyIcon(old);
+        }
+    }
+}
+
+/// Con "Mostrar CPU": compara con la lectura anterior y actualiza historial e icono. Apagada no
+/// llama a nada.
+fn sample_cpu(hwnd: HWND) {
+    if !with_ui(|ui| ui.settings.show_cpu).unwrap_or(false) {
+        return;
+    }
+    let Some(now) = cpu::read() else {
+        return;
+    };
+    let tray = with_ui(|ui| {
+        let prev = ui.cpu_prev.replace(now)?;
+        let p = cpu::percent(prev, now)?;
+        ui.cpu = Some(p);
+        ui.cpu_history.push(p);
+        let state = (p.round() as u32, mem::level(p));
+        let replaced = if ui.cpu_state != Some(state) {
+            ui.cpu_state = Some(state);
+            let fresh = icon::create(ui.tray_size, p / 100.0, level_rgb(state.1));
+            Some(std::mem::replace(&mut ui.cpu_icon, fresh))
+        } else {
+            None
+        };
+        Some((ui.cpu_icon, replaced, p))
+    })
+    .flatten();
+    if let Some((current, replaced, p)) = tray {
+        update_tray(hwnd, TRAY_CPU_ID, current, replaced, &cpu_tooltip(Some(p)));
     }
 }
 
@@ -715,11 +1164,11 @@ fn hover_check(hwnd: HWND) {
 }
 
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    let Some((texts, taskbar_created, topmost, dpi, tray_icon, current_mem)) = with_ui(|ui| {
+    let Some((texts, taskbar_created, prefs, dpi, tray_icon, current_mem)) = with_ui(|ui| {
         (
             ui.texts,
             ui.taskbar_created,
-            ui.settings.topmost,
+            ui.settings,
             ui.dpi,
             ui.tray_icon,
             ui.mem,
@@ -727,6 +1176,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
     }) else {
         return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
     };
+    let (topmost, show_cpu) = (prefs.topmost, prefs.show_cpu);
     match msg {
         WM_NCHITTEST => {
             // Toda la ventana arrastra (HTCAPTION) salvo la X, que es "cliente" para recibir el clic.
@@ -743,7 +1193,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         // Doble clic en la "barra de titulo" no maximiza ni hace nada.
         WM_NCLBUTTONDBLCLK => LRESULT(0),
         WM_NCRBUTTONUP | WM_RBUTTONUP => {
-            show_menu(hwnd, texts, topmost);
+            show_menu(hwnd, texts, &prefs);
             LRESULT(0)
         }
         WM_NCMOUSEMOVE => {
@@ -772,6 +1222,14 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         }
         WM_TIMER if wparam.0 == TIMER_HOVER => {
             hover_check(hwnd);
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == TIMER_DISK => {
+            sample_disks(hwnd);
+            LRESULT(0)
+        }
+        WM_WSL_DONE => {
+            wsl_done(hwnd, lparam);
             LRESULT(0)
         }
         WM_TIMER if wparam.0 == TIMER_SAMPLE => {
@@ -810,7 +1268,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         WM_TRAY => {
             match loword(lparam.0 as usize) {
                 WM_LBUTTONUP => toggle(hwnd, topmost),
-                WM_RBUTTONUP | WM_CONTEXTMENU => show_menu(hwnd, texts, topmost),
+                WM_RBUTTONUP | WM_CONTEXTMENU => show_menu(hwnd, texts, &prefs),
                 _ => {}
             }
             LRESULT(0)
@@ -828,6 +1286,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 ID_AUTOSTART => {
                     autostart::set_enabled(!autostart::is_enabled());
                 }
+                ID_CPU => set_show_cpu(hwnd, !show_cpu),
+                ID_WSL => toggle_disk(hwnd, None),
+                id if (ID_DISK_BASE..ID_DISK_BASE + 26).contains(&id) => {
+                    toggle_disk(hwnd, Some((b'A' + (id - ID_DISK_BASE) as u8) as char));
+                }
                 ID_QUIT => unsafe {
                     let _ = DestroyWindow(hwnd);
                 },
@@ -844,6 +1307,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             });
             // Se respeta la esquina sugerida por Windows; el tamano sale de nuestras medidas.
             let suggested = unsafe { *(lparam.0 as *const RECT) };
+            let height =
+                with_ui(|ui| window_height(dpi, show_cpu, &ui.disk_rows)).unwrap_or_default();
             unsafe {
                 let _ = SetWindowPos(
                     hwnd,
@@ -851,7 +1316,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     suggested.left,
                     suggested.top,
                     px(WIDTH, dpi),
-                    window_height(dpi),
+                    height,
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
             }
@@ -859,18 +1324,27 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             LRESULT(0)
         }
         WM_DESTROY => {
-            let nid = tray_data(hwnd, tray_icon, "");
             unsafe {
                 let _ = KillTimer(Some(hwnd), TIMER_HOVER);
                 let _ = KillTimer(Some(hwnd), TIMER_SAMPLE);
-                let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
+                let _ = KillTimer(Some(hwnd), TIMER_DISK);
+            }
+            remove_tray(hwnd, TRAY_ID);
+            if show_cpu {
+                remove_tray(hwnd, TRAY_CPU_ID);
+            }
+            unsafe {
                 PostQuitMessage(0);
             }
             LRESULT(0)
         }
         m if m != 0 && m == taskbar_created => {
-            // Explorer se reinicio: hay que volver a poner el icono.
-            add_tray(hwnd, tray_icon, &tooltip(current_mem.as_ref()));
+            // Explorer se reinicio: hay que volver a poner los iconos.
+            add_tray(hwnd, TRAY_ID, tray_icon, &tooltip(current_mem.as_ref()));
+            if show_cpu {
+                let (cpu_icon, cpu_now) = with_ui(|ui| (ui.cpu_icon, ui.cpu)).unwrap_or_default();
+                add_tray(hwnd, TRAY_CPU_ID, cpu_icon, &cpu_tooltip(cpu_now));
+            }
             LRESULT(0)
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
@@ -963,7 +1437,7 @@ pub fn run() {
         );
         let [left, top] = placement::choose(
             prefs.pos,
-            (px(WIDTH, pdpi), window_height(pdpi)),
+            (px(WIDTH, pdpi), window_height(pdpi, prefs.show_cpu, &[])),
             &monitors(),
             fallback,
         );
@@ -985,7 +1459,7 @@ pub fn run() {
             left,
             top,
             px(WIDTH, dpi),
-            window_height(dpi),
+            window_height(dpi, prefs.show_cpu, &[]),
             None,
             None,
             Some(instance),
@@ -1027,6 +1501,12 @@ pub fn run() {
             None => (icon::create(tray_size, 0.0, GREEN), None),
         };
         let topmost = prefs.topmost;
+        let show_cpu = prefs.show_cpu;
+        let cpu_icon = if show_cpu {
+            icon::create(tray_size, 0.0, GREEN)
+        } else {
+            HICON::default()
+        };
         let ui = Ui {
             texts: text::current(),
             dpi: real_dpi,
@@ -1038,6 +1518,13 @@ pub fn run() {
             tray_icon,
             tray_state,
             tray_size,
+            cpu_prev: if show_cpu { cpu::read() } else { None },
+            cpu: None,
+            cpu_history: History::new(),
+            cpu_icon,
+            cpu_state: None,
+            disk_rows: Vec::new(),
+            wsl_busy: false,
             hover: false,
             hot: false,
         };
@@ -1048,14 +1535,20 @@ pub fn run() {
                 left,
                 top,
                 px(WIDTH, real_dpi),
-                window_height(real_dpi),
+                window_height(real_dpi, show_cpu, &[]),
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
         }
-        add_tray(hwnd, tray_icon, &tooltip(first.as_ref()));
+        add_tray(hwnd, TRAY_ID, tray_icon, &tooltip(first.as_ref()));
+        if show_cpu {
+            add_tray(hwnd, TRAY_CPU_ID, cpu_icon, &cpu_tooltip(None));
+        }
         UI.with_borrow_mut(|slot| *slot = Some(ui));
 
         SetTimer(Some(hwnd), TIMER_SAMPLE, SAMPLE_MS, None);
+        // Primera lectura de discos ya (ajusta el alto) y despues cada 30 s.
+        sample_disks(hwnd);
+        SetTimer(Some(hwnd), TIMER_DISK, DISK_MS, None);
         show(hwnd, topmost);
 
         let mut msg = MSG::default();
@@ -1066,8 +1559,10 @@ pub fn run() {
         UI.with_borrow_mut(|slot| {
             if let Some(ui) = slot.take() {
                 free_fonts(&ui.fonts);
-                if !ui.tray_icon.is_invalid() {
-                    let _ = DestroyIcon(ui.tray_icon);
+                for icon in [ui.tray_icon, ui.cpu_icon] {
+                    if !icon.is_invalid() {
+                        let _ = DestroyIcon(icon);
+                    }
                 }
             }
         });

@@ -1,4 +1,5 @@
-//! Preferencias en el registro, HKCU\Software\ram-lite: siempre encima y posicion de la ventana.
+//! Preferencias en el registro, HKCU\Software\ram-lite: siempre encima, mostrar CPU, discos y WSL
+//! elegidos y posicion de la ventana.
 //! Sin archivos ni JSON. Un valor que falte o no se pueda leer cae a lo de fabrica.
 
 use std::ffi::c_void;
@@ -11,12 +12,21 @@ use windows::core::{PCWSTR, w};
 
 const KEY: PCWSTR = w!("Software\\ram-lite");
 const TOPMOST: PCWSTR = w!("Topmost");
+const SHOW_CPU: PCWSTR = w!("ShowCpu");
+const DISKS: PCWSTR = w!("Disks");
+const WSL: PCWSTR = w!("Wsl");
 const POS_X: PCWSTR = w!("PosX");
 const POS_Y: PCWSTR = w!("PosY");
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Settings {
     pub topmost: bool,
+    /// Medir y mostrar la CPU (de fabrica, apagado).
+    pub show_cpu: bool,
+    /// Unidades a medir, una por bit (bit 0 = A:). De fabrica, ninguna.
+    pub disks: u32,
+    /// Medir las distros de WSL. De fabrica, apagado.
+    pub wsl: bool,
     /// Esquina superior izquierda en px fisicos de pantalla.
     pub pos: Option<[i32; 2]>,
 }
@@ -60,12 +70,27 @@ pub fn load() -> Settings {
     };
     Settings {
         topmost: get(TOPMOST).is_none_or(|v| v != 0),
+        show_cpu: get(SHOW_CPU).is_some_and(|v| v != 0),
+        disks: get(DISKS).unwrap_or(0),
+        wsl: get(WSL).is_some_and(|v| v != 0),
         pos,
     }
 }
 
 pub fn save_topmost(on: bool) {
     set(TOPMOST, u32::from(on));
+}
+
+pub fn save_show_cpu(on: bool) {
+    set(SHOW_CPU, u32::from(on));
+}
+
+pub fn save_disks(mask: u32) {
+    set(DISKS, mask);
+}
+
+pub fn save_wsl(on: bool) {
+    set(WSL, u32::from(on));
 }
 
 pub fn save_pos(pos: [i32; 2]) {

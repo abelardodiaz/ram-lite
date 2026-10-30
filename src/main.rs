@@ -1,5 +1,7 @@
-//! ram-lite: widget nativo minimo para Windows con el uso de memoria RAM, Win32 + GDI.
-//! Sin WebView, sin hilos y sin red: un temporizador cada 2 s llama a GlobalMemoryStatusEx.
+//! ram-lite: widget nativo minimo para Windows con el uso de memoria RAM, Win32 + GDI; CPU y
+//! discos opcionales desde el menu. Sin WebView ni red: un temporizador cada 2 s llama a
+//! GlobalMemoryStatusEx (y GetSystemTimes si la CPU esta encendida), otro cada 30 s mide los
+//! discos elegidos. Solo WSL se mide en un hilo corto.
 //! Estilo y patrones de ventana tomados de la version lite de claude-usage-widgets.
 
 #![cfg_attr(not(test), windows_subsystem = "windows")]
@@ -9,6 +11,8 @@ compile_error!("ram-lite es solo para Windows");
 
 mod app;
 mod autostart;
+mod cpu;
+mod disk;
 mod icon;
 mod mem;
 mod placement;
